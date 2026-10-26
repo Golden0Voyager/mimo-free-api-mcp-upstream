@@ -197,6 +197,19 @@ function formatOpenAIChunk(content: string | null, model: string, finishReason: 
     return `data: ${JSON.stringify(chunk)}\n\n`;
 }
 
+/**
+ * 🌟 平台模型映射（2026-10 平台升级后）：
+ * - v2-flash 系列已在 react 协议中下线（返回"模型名称错误"），映射到现役 flash 档位 mimo-v2.6-flash
+ * - 其余名称原样透传（v2.5 / v2.5-pro / v2.6-pro / v2.6-flash 均为裸 ID）
+ */
+function mapStationModel(original: string): string {
+    const low = original.toLowerCase();
+    if (low.includes("v2-flash")) return "mimo-v2.6-flash";
+    if (low === "mimo-v2-omni") return "mimo-v2.5";
+    if (low === "mimo-v2-pro") return "mimo-v2.5-pro";
+    return low;
+}
+
 // 三步走：上传图片到小米文件服务器
 async function uploadMediaToMimo(base64Data: string, cookie: string, xiaomichatbot_ph: string, model: string): Promise<any> {
     // 🌟 核心修正：剥离 Data URI 前缀，确保 Buffer.from 拿到的是纯 base64 数据
@@ -250,16 +263,7 @@ async function uploadMediaToMimo(base64Data: string, cookie: string, xiaomichatb
         logger.info(`[FDS PUT Success] ${objectName}`);
 
         // 3. 注册挂载并换取核心 ID (增加重试机制)
-        const getReadyModelForParse = (m: string) => {
-            const low = m.toLowerCase();
-            if (low.includes("flash")) {
-                return low.endsWith("-studio") ? low : `${low}-studio`;
-            }
-            if (low === "mimo-v2-omni") return "mimo-v2.5";
-            if (low === "mimo-v2-pro") return "mimo-v2.5-pro";
-            return low;
-        };
-        const readyModelForParse = getReadyModelForParse(model);
+        const readyModelForParse = mapStationModel(model);
         const parseUrl = `https://aistudio.xiaomimimo.com/open-apis/resource/parse?fileUrl=${encodeURIComponent(resourceUrl)}&objectName=${encodeURIComponent(objectName)}&model=${readyModelForParse}&xiaomichatbot_ph=${encodeURIComponent(xiaomichatbot_ph)}`;
         logger.info(`[Multimedia Parse Request] URL: ${parseUrl}`);
         
@@ -292,6 +296,25 @@ async function uploadMediaToMimo(base64Data: string, cookie: string, xiaomichatb
             if (isVideo) mediaType = "video";
             else if (isAudio) mediaType = "audio";
             else if (mimeType.includes("pdf")) mediaType = "pdf";
+
+            // 🌟 新协议必需：图片必须提交内容审核 (audit/submit)，否则聊天时被 sensitive_query 静默拦截
+            if (mediaType === "image") {
+                try {
+                    const auditRes = await axios.post(
+                        `https://aistudio.xiaomimimo.com/open-apis/audit/submit?xiaomichatbot_ph=${encodeURIComponent(xiaomichatbot_ph)}`,
+                        { businessCode: "chat_input_image", fileUrl: resourceUrl, fileName },
+                        { headers }
+                    );
+                    const auditResult = auditRes?.data?.data?.result;
+                    if (auditResult === "PASS") {
+                        logger.info(`[Image Audit] PASS: ${fileName}`);
+                    } else {
+                        logger.warn(`[Image Audit] Non-PASS result "${auditResult}" for ${fileName} — backend may reject this image`);
+                    }
+                } catch (e: any) {
+                    logger.warn(`[Image Audit] Submit failed (proceeding anyway): ${e.message}`);
+                }
+            }
 
             const result = {
                 mediaType: mediaType,
@@ -407,13 +430,14 @@ export function createCompletionStream(model: string, messages: any[], convId?: 
     let forceThinking = false;
     let lastMsgId = "0";
 
-    // 🌟 2. 智商升配与模型锁定（识图场景锁定 Omni 以提高解析成功率）
+    // 🌟 2. 智商升配与模型锁定（识图场景锁定 Omni 以提高解析成功率；显式请求 V2.6 时保持用户选择）
+    const prefersV26 = model.toLowerCase().includes("v2.6");
     if (base64Medias.length > 0) {
-        readyModel = "mimo-v2.5"; 
-        logger.info(`[AutoUpgrade] Vision detected, switching to ${readyModel}`);
+        if (!prefersV26) readyModel = "mimo-v2.5";
+        logger.info(`[AutoUpgrade] Vision detected, using ${readyModel}`);
     } else if (req?.body?.tools) {
-        readyModel = "mimo-v2.5";
-        logger.info(`[AutoUpgrade] Tools detected, switching to ${readyModel}`);
+        if (!prefersV26) readyModel = "mimo-v2.5";
+        logger.info(`[AutoUpgrade] Tools detected, using ${readyModel}`);
     }
 
     // 🌟 3. 规范超参
@@ -561,24 +585,23 @@ export function createCompletionStream(model: string, messages: any[], convId?: 
                 }).join("\n\n");
 
                 const agentPrompt = `[AGENT SYSTEM PROTOCOL]
-You are now operating as an Advanced Agent. You must solve the user's request by utilizing the tools provided below.
+You are operating as an agent with EXTERNAL tools that only the client can execute. You cannot perform these actions yourself.
 
 # AVAILABLE TOOLS
 ${toolsText}
 
 # TOOL CALLING PROTOCOL
-1. **Thought Phase**: Use <think> tags to analyze whether a tool is needed.
-2. **Action Phase**: If a tool is required, you MUST output the JSON object wrapped in <tool_call> tags. Example:
-<tool_call>
-{"tool_calls": [{"id": "call_unique", "type": "function", "function": {"name": "tool_name", "arguments": "{\"arg_name\": \"value\"}"}}]}
-</tool_call>
-3. **Observation Phase**: After a tool is called, the system will provide the "Observation Record". Do NOT hallucinate tool results.
-4. **Final Answer**: Once you have enough information, provide a direct answer to the user.
+1. **Action Phase**: If the task requires an external tool, output ONLY the JSON object wrapped in [TOOL_CALL] markers. Example:
+[TOOL_CALL]
+{"tool_calls": [{"id": "call_unique", "type": "function", "function": {"name": "tool_name", "arguments": "{\\"arg_name\\": \\"value\\"}"}}]}
+[/TOOL_CALL]
+2. **Observation Phase**: After a tool is called, the system will provide the "Observation Record". Do NOT hallucinate tool results.
+3. **Final Answer**: Once you have enough information, provide a direct answer to the user.
+4. If the task can be answered without any external action, answer directly without markers.
 
 # CONSTRAINTS
 - NEVER explain that you are calling a tool.
-- DO NOT use internal Search tools if an external tool can do the job.
-- Output ONLY the <tool_call> block if tool calling is active.
+- Output ONLY the [TOOL_CALL] block when requesting a tool, and wait for its result.
 
 Current Task: `;
                 finalQuery = agentPrompt + finalQuery;
@@ -588,35 +611,17 @@ Current Task: `;
             const parentId = "0"; 
             logger.info(`[Final Spliced Query Snapshot] ${finalQuery.substring(0, 100)}...`);
 
-            // 🌟 3. STATION 模型映射优化
-            const getStationModel = (original: string) => {
-                const low = original.toLowerCase();
-                if (low.includes("flash")) {
-                    return low.endsWith("-studio") ? low : `${low}-studio`;
-                }
-                if (low === "mimo-v2-omni") return "mimo-v2.5";
-                if (low === "mimo-v2-pro") return "mimo-v2.5-pro";
-                return low;
-            };
+            // 🌟 3. STATION 模型映射优化（v2-flash 已下线，映射见 mapStationModel）
+            const readyModelWithStudio = mapStationModel(readyModel);
 
-            const readyModelWithStudio = getStationModel(readyModel);
-            
             const payload: any = {
                 msgId: uuidv4().replace(/-/g, ''), // 注入模式下，随机 msgId 即可
                 conversationId: safeConvId,
-                query: finalQuery, 
-                messages: [], // 不传历史数组，防止后端 ID 校验失败导致的静默重置
-                parentId: currentParentId,
-                save: true,             
-                isEditedQuery: false, 
-                source: 'STATION', 
-                scene: 'STATION',
-                isLocal: false,
+                query: finalQuery,
+                isEditedQuery: false,
+                // 🌟 react 协议：上下文由后端按 conversationId 记忆，不再传 parentId/save/source/scene/messages
                 modelConfig: {
-                    enableThinking: (readyModel.includes("v2.5") || readyModel.includes("pro")), 
-                    thinking: {
-                        type: (readyModel.includes("v2.5") || readyModel.includes("pro")) ? "enabled" : "disabled"
-                    },
+                    enableThinking: (readyModel.includes("v2.5") || readyModel.includes("pro")),
                     webSearchStatus: (req?.body?.web_search === true) ? "enabled" : "disabled",
                     model: readyModelWithStudio,
                     temperature: temperature,
@@ -631,8 +636,8 @@ Current Task: `;
                     size: m.size,
                     status: "completed",
                     objectName: m.objectName,
-                    tokenUsage: m.tokenUsage, 
-                    url: m.url 
+                    tokenUsage: m.tokenUsage,
+                    url: m.url
                 }))
             };
             logger.info(`[Mimo Payload JSON] ${JSON.stringify(payload)}`);
@@ -650,14 +655,16 @@ Current Task: `;
             }
             
             const encodedPh = encodeURIComponent(xiaomichatbot_ph);
-            const url = `https://aistudio.xiaomimimo.com/open-apis/bot/chat?xiaomichatbot_ph=${encodedPh}`;
-            const headers: any = { 
-                "Content-Type": "application/json", 
-                "Accept": "text/event-stream, text/plain, */*",
-                "Cookie": cookie, 
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/120.0.0.0", 
-                "Referer": "https://aistudio.xiaomimimo.com/", 
-                "Origin": "https://aistudio.xiaomimimo.com" 
+            // 🌟 平台升级 (2026-10)：官方网页客户端已切换至 react/chat 端点，旧 bot/chat 对所有请求返回「平台升级」提示
+            const url = `https://aistudio.xiaomimimo.com/open-apis/react/chat?xiaomichatbot_ph=${encodedPh}`;
+            const headers: any = {
+                "Content-Type": "application/json",
+                "Accept": "*/*",
+                "Cookie": cookie,
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+                "Referer": "https://aistudio.xiaomimimo.com/",
+                "Origin": "https://aistudio.xiaomimimo.com",
+                "x-timezone": "Asia/Shanghai"
             };
             logger.info(`[Marker] 3. Target URL: ${url}`);
 
@@ -665,11 +672,11 @@ Current Task: `;
             const saveUrl = `https://aistudio.xiaomimimo.com/open-apis/chat/conversation/save?xiaomichatbot_ph=${encodedPh}`;
             const titleUrl = `https://aistudio.xiaomimimo.com/open-apis/chat/conversation/genTitle?xiaomichatbot_ph=${encodedPh}`;
             
+            // 🌟 react 协议的 save 精简为三字段，不再透传 multiMedias/parentId
             const savePayload = {
                 conversationId: safeConvId,
                 title: query.substring(0, 30) || "新对话",
-                type: "chat",
-                multiMedias: payload.multiMedias // 🌟 必须同步透传图片 ID
+                type: "chat"
             };
 
             const titlePayload = {
@@ -680,19 +687,20 @@ Current Task: `;
             let retryCount = 0;
             const maxRetries = 3;
             let currentQuery = finalQuery; 
-            let finalSuccess = false;
+            let finalSuccess = false; 
             let nativeUsage: any = null; 
             let fullResponseText = ""; 
-            let isThinking = false; 
             let searchReferences: { title: string, url: string }[] = []; 
             let postThinkBuffer = ""; 
+            let anyToolEmitted = false;
 
             while (retryCount <= maxRetries && !finalSuccess) {
                 payload.query = currentQuery;
                 payload.msgId = uuidv4().replace(/-/g, ''); // 每次重试更新 msgId
 
                 fullResponseText = ""; // 重置单轮变量
-                isThinking = false; 
+                // 🌟 react 协议：error / sensitive_query 事件（如「平台升级」「模型名称错误」「敏感拦截」）
+                let streamErrorEvent: { type: string, message: string } | null = null;
                 searchReferences = []; 
                 postThinkBuffer = ""; 
                 let citationBuffer = "";
@@ -704,11 +712,11 @@ Current Task: `;
                 const flushCitations = (newText: string, isFinal = false) => {
                     const cleanText = newText.replace(/\u0000/g, "");
                     
-                    // 🌟 核心拦截：检测并屏蔽 <tool_call> 标签内的内容流出
+                    // 🌟 核心拦截：检测并屏蔽工具调用标记内的内容流出（新旧两种标记）
                     if (!isFinal) {
-                        if (cleanText.includes("<tool_call>")) inToolCallTag = true;
+                        if (cleanText.includes("<tool_call>") || cleanText.includes("[TOOL_CALL]")) inToolCallTag = true;
                         if (inToolCallTag) {
-                            if (cleanText.includes("</tool_call>")) inToolCallTag = false;
+                            if (cleanText.includes("</tool_call>") || cleanText.includes("[/TOOL_CALL]")) inToolCallTag = false;
                             return ""; // 拦截流式输出
                         }
                     }
@@ -775,7 +783,7 @@ Current Task: `;
 
                 const parser = createParser((event) => {
                     if (event.type === "event") {
-                        // 🌟 核心拦截: 捕获搜索结果、用法数据
+                        // 🌟 核心拦截: 捕获搜索结果、用量数据
                         if (event.event === "web_search") {
                             try {
                                 const items = JSON.parse(event.data);
@@ -784,79 +792,48 @@ Current Task: `;
                                         title: item.name || item.title,
                                         url: item.url
                                     }));
-                                    return;
                                 }
                             } catch (e) {}
+                            return;
                         }
                         if (event.event === "usage") {
                             try { nativeUsage = JSON.parse(event.data); } catch (e) {}
                             return;
                         }
-                        
+                        // 🌟 react 协议错误事件：error（如「模型名称错误」）与 sensitive_query（敏感内容拦截）
+                        if (event.event === "error" || event.event === "sensitive_query") {
+                            let message = event.data;
+                            try { const d = JSON.parse(event.data); if (d.content) message = d.content; } catch (e) {}
+                            streamErrorEvent = { type: event.event, message: String(message) };
+                            logger.error(`[Mimo ${event.event}] ${message}`);
+                            return;
+                        }
+                        // dialogId / finish 等控制事件不含正文；未命名事件保持旧行为走正文解析
+                        if (event.event && event.event !== "message") return;
+
                         // 🌟 核心 ID 追踪：捕获 Mimo 为最后一条 AI 消息分配的真实 ID
                         if (event.id) {
                             lastMsgId = event.id;
                         }
-                        // 🌟 STATION 协议核心：捕获数据内容并提取文本
+                        // 🌟 react 协议核心：思维链走独立 reasoningContent 字段，正文走 content 字段
                         try {
                             const data = JSON.parse(event.data);
-                            
-                            let content = data.content || "";
-                            content = content.replace("[DONE]", "");
-                            
-                            // 过滤掉内部信号
-                            if (content === "webSearch" || /^\d+$/.test(content)) {
-                                return;
-                            }
-                            
-                            // 处理思维链逻辑 (<think> 标签)
-                            if (content.includes("<think>")) {
-                                const parts = content.split("<think>");
-                                if (parts[0]) {
-                                    const out = flushCitations(parts[0]);
-                                    if (out) transStream.write(formatOpenAIChunk(out, model)); 
-                                }
-                                isThinking = true;
-                                if (parts[1]) {
-                                    const subParts = parts[1].split("</think>");
-                                    transStream.write(formatOpenAIChunk("", model, null, subParts[0]));
-                                    if (subParts.length > 1) { 
-                                        isThinking = false; 
-                                        if (subParts[1]) {
-                                            const out = flushCitations(subParts[1]);
-                                            if (out) transStream.write(formatOpenAIChunk(out, model));
-                                        }
-                                    }
-                                }
-                                fullResponseText += content.replace("<think>", "").replace("</think>", "");
+
+                            if (data.reasoningContent) {
+                                const reasoning = String(data.reasoningContent).replace(/\u0000/g, "");
+                                if (reasoning) transStream.write(formatOpenAIChunk(null, model, null, reasoning));
                                 return;
                             }
 
-                            if (content.includes("</think>")) {
-                                const parts = content.split("</think>");
-                                if (parts[0]) transStream.write(formatOpenAIChunk("", model, null, parts[0]));
-                                isThinking = false;
-                                const postThink = (parts[1] || "");
-                                if (postThink) {
-                                    const out = flushCitations(postThink);
-                                    if (out) transStream.write(formatOpenAIChunk(out, model));
-                                    postThinkBuffer += postThink;
-                                    fullResponseText += postThink;
-                                }
-                                return;
-                            }
+                            let content = data.content || "";
+                            content = String(content).replace(/\u0000/g, "").replace("[DONE]", "");
+                            if (!content) return;
 
                             fullResponseText += content;
-                            if (!isThinking) postThinkBuffer += content;
+                            postThinkBuffer += content;
 
-                            if (content) {
-                                if (isThinking) { 
-                                    transStream.write(formatOpenAIChunk(null, model, null, content)); 
-                                } else { 
-                                    const out = flushCitations(content);
-                                    if (out) transStream.write(formatOpenAIChunk(out, model)); 
-                                }
-                            }
+                            const out = flushCitations(content);
+                            if (out) transStream.write(formatOpenAIChunk(out, model));
                         } catch (e) {
                             // 非 JSON 数据（如 [DONE]）会被忽略
                         }
@@ -888,7 +865,6 @@ Current Task: `;
                                 await checkAndTriggerSplit(tokenizer.encode(query).length);
                                 currentQuery = query; // 更新为拆分后的最后一段
                                 payload.conversationId = crypto.createHash("md5").update(currentConvId || "").digest("hex");
-                                payload.parentId = currentParentId;
                                 retryCount++;
                                 continue;
                             }
@@ -936,14 +912,14 @@ Current Task: `;
                             }
 
                             // 🌟 兜底：发送常规正文 (如果它不是工具调用)
-                            if (fullResponseText.length > 0 && !fullResponseText.includes("<tool_call>")) {
+                            if (fullResponseText.length > 0 && !fullResponseText.includes("<tool_call>") && !fullResponseText.includes("[TOOL_CALL]")) {
                                 logger.info(`[Response] Emitting standard text (${postThinkBuffer.length} chars)`);
                                 // 注意：此处可能与流式输出重复，仅作为极其罕见的流式中断兜底
                                 // transStream.write(formatOpenAIChunk(postThinkBuffer, model));
                             }
 
-                            // 🌟 核心：多态工具解析与内容分发 (Tag 模式)
-                            const toolCallTagRegex = /<tool_call>([\s\S]*?)<\/tool_call>/g;
+                            // 🌟 核心：多态工具解析与内容分发 (兼容 <tool_call> 与 [TOOL_CALL] 两种标记)
+                            const toolCallTagRegex = /(?:<tool_call>|\[TOOL_CALL\])([\s\S]*?)(?:<\/tool_call>|\[\/TOOL_CALL\])/g;
                             let match;
                             let foundAnyTool = false;
 
@@ -978,6 +954,7 @@ Current Task: `;
                                         logger.info(`[Tools Detect] Found ${mappedToolCalls.length} tool calls via Tag.`);
                                         transStream.write(formatOpenAIChunk(null, model, "tool_calls", null, null, null, mappedToolCalls));
                                         foundAnyTool = true;
+                                        anyToolEmitted = true;
                                     }
                                 } catch (e) { 
                                     logger.warn(`[Tools] Tag Parse error: ${e.message}`); 
@@ -994,6 +971,21 @@ Current Task: `;
                     });
 
                     if (isSuccess) {
+                        if (streamErrorEvent) {
+                            // 超长类错误走自适应分段重试（与 HTTP 400 路径同机制）
+                            if ((streamErrorEvent.message.includes("超长") || streamErrorEvent.message.includes("too long")) && !isAlreadySplit) {
+                                logger.warn(`[Adaptive fallback] Stream error "${streamErrorEvent.message}" — retrying with split...`);
+                                updateSafeThreshold(tokenizer.encode(currentQuery).length);
+                                await checkAndTriggerSplit(tokenizer.encode(query).length);
+                                currentQuery = query;
+                                payload.conversationId = crypto.createHash("md5").update(currentConvId || "").digest("hex");
+                                retryCount++;
+                                continue;
+                            }
+                            // 其余错误（模型名称错误 / 敏感拦截 / 平台提示等）：透传给客户端并终止本轮
+                            logger.error(`[Mimo Stream Error Event] ${streamErrorEvent.type}: ${streamErrorEvent.message}`);
+                            transStream.write(formatOpenAIChunk(`[Mimo API Error] ${streamErrorEvent.message}`, model));
+                        }
                         finalSuccess = true;
                     } else {
                         retryCount++;
@@ -1020,8 +1012,7 @@ Current Task: `;
                 const finalSavePayload = {
                     ...savePayload,
                     title: query.substring(0, 32) || "New Mimo Chat",
-                    type: "chat",
-                    parentId: currentParentId // 使用当前计算出的 parentId 进行同步，实现 UI 链路对齐
+                    type: "chat"
                 };
 
                 // 更新全局缓存供下一轮使用
@@ -1048,7 +1039,14 @@ Current Task: `;
                     .catch(e => logger.warn(`[Sidebar Sync] Network error during persistence: ${e.message}`));
             }
 
-            transStream.write(formatOpenAIChunk("", model, "stop", "", nativeUsage));
+            // 🌟 react 协议 usage 事件为驼峰字段，统一映射为 OpenAI 命名
+            const openAIUsage = nativeUsage ? {
+                prompt_tokens: nativeUsage.promptTokens ?? nativeUsage.prompt_tokens,
+                completion_tokens: nativeUsage.completionTokens ?? nativeUsage.completion_tokens,
+                total_tokens: nativeUsage.totalTokens ?? nativeUsage.total_tokens
+            } : null;
+            // 发出过工具调用时，最终 finish_reason 保持 tool_calls 语义
+            transStream.write(formatOpenAIChunk("", model, anyToolEmitted ? "tool_calls" : "stop", "", openAIUsage));
             transStream.write(`data: [DONE]\n\n`);
             transStream.end();
 
@@ -1095,7 +1093,8 @@ export async function createCompletion(model: string, messages: any[], convId?: 
                     toolCalls = delta.tool_calls;
                     finishReason = "tool_calls";
                 }
-                if (data.choices[0].finish_reason) finishReason = data.choices[0].finish_reason;
+                // tool_calls 优先：尾部 stop chunk（usage 载体）不得覆盖 tool_calls 语义
+                if (data.choices[0].finish_reason && finishReason !== "tool_calls") finishReason = data.choices[0].finish_reason;
             } catch (e) {
                 // 有些 event 数据可能不是 JSON (比如纯文本)，忽略报错
             }
@@ -1138,37 +1137,32 @@ export async function performSearch(query: string, req?: any) {
     const creds = await getCredentials(req);
     const { cookie, xiaomichatbot_ph } = creds;
     const encodedPh = encodeURIComponent(xiaomichatbot_ph);
-    const url = `https://aistudio.xiaomimimo.com/open-apis/bot/chat?xiaomichatbot_ph=${encodedPh}`;
+    // 🌟 平台升级 (2026-10)：react/chat 端点
+    const url = `https://aistudio.xiaomimimo.com/open-apis/react/chat?xiaomichatbot_ph=${encodedPh}`;
     
-    logger.info(`[Search Request] Query: ${query}`);
+    logger.info(`[Search Request] Query: ${query} | Model: ${process.env.MCP_SEARCH_MODEL || "mimo-v2.5-pro"}`);
 
     const payload: any = {
         msgId: uuidv4().replace(/-/g, ''),
         conversationId: uuidv4().replace(/-/g, '').substring(0, 32),
         query: query,
-        messages: [],
-        parentId: "0",
-        save: false,
-        source: 'STATION',
-        scene: 'STATION',
-        atMsgId: '',
+        isEditedQuery: false,
         modelConfig: {
             enableThinking: true,
-            thinking: { type: "enabled" },
-            enableReference: true, 
             webSearchStatus: "enabled",
-            model: "mimo-v2.5-pro", 
+            model: mapStationModel(process.env.MCP_SEARCH_MODEL || "mimo-v2.5-pro"), 
         },
         multiMedias: []
     };
 
     const headers: any = {
         "Content-Type": "application/json",
-        "Accept": "text/event-stream",
+        "Accept": "*/*",
         "Cookie": cookie,
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
         "Referer": "https://aistudio.xiaomimimo.com/",
-        "Origin": "https://aistudio.xiaomimimo.com"
+        "Origin": "https://aistudio.xiaomimimo.com",
+        "x-timezone": "Asia/Shanghai"
     };
 
     const controller = new AbortController();
@@ -1198,8 +1192,8 @@ export async function performSearch(query: string, req?: any) {
                     } catch (e) {
                         logger.error(`[Search Parse Error] ${e.message}`);
                     }
-                } else if (event.event === "error") {
-                    // 如果后端直接报错文本超长或其他
+                } else if (event.event === "error" || event.event === "sensitive_query") {
+                    // 如果后端直接报错（文本超长/敏感拦截等）
                     logger.error(`[Search API Error Payload] ${event.data}`);
                     resolved = true;
                     controller.abort();
@@ -1283,9 +1277,10 @@ export async function performVision(query: string, medias: any[], req?: any) {
     const creds = await getCredentials(req);
     const { cookie, xiaomichatbot_ph } = creds;
     const encodedPh = encodeURIComponent(xiaomichatbot_ph);
-    const url = `https://aistudio.xiaomimimo.com/open-apis/bot/chat?xiaomichatbot_ph=${encodedPh}`;
+    // 🌟 平台升级 (2026-10)：react/chat 端点
+    const url = `https://aistudio.xiaomimimo.com/open-apis/react/chat?xiaomichatbot_ph=${encodedPh}`;
     
-    logger.info(`[Vision Request] Query: ${query} | Medias: ${medias.length}`);
+    logger.info(`[Vision Request] Query: ${query} | Medias: ${medias.length} | Model: ${req?.body?.model || process.env.MCP_VISION_MODEL || "mimo-v2.5"}`);
 
     // 1. 处理媒体上传
     const multiMedias: any[] = [];
@@ -1349,7 +1344,7 @@ export async function performVision(query: string, medias: any[], req?: any) {
             if (!mediaCache.has(md5)) isAnyNewMedia = true;
             
             const dataUrl = `data:${mimeType};base64,${base64}`;
-            const mediaObj = await uploadMediaToMimo(dataUrl, cookie, xiaomichatbot_ph, req?.body?.model || "mimo-v2.5");
+            const mediaObj = await uploadMediaToMimo(dataUrl, cookie, xiaomichatbot_ph, req?.body?.model || process.env.MCP_VISION_MODEL || "mimo-v2.5");
             
             if (mediaObj) {
                 let mediaType = "image";
@@ -1382,19 +1377,12 @@ export async function performVision(query: string, medias: any[], req?: any) {
         msgId: uuidv4().replace(/-/g, ''),
         conversationId: uuidv4().replace(/-/g, '').substring(0, 32),
         query: query,
-        messages: [],
-        parentId: "0",
-        save: true,
         isEditedQuery: false,
-        source: 'STATION',
-        scene: 'STATION',
-        isLocal: false,
-        atMsgId: '',
+        // 🌟 react 协议精简 payload
         modelConfig: {
             enableThinking: true,
-            thinking: { type: "enabled" },
             webSearchStatus: "disabled",
-            model: req?.body?.model || "mimo-v2.5", 
+            model: mapStationModel(req?.body?.model || process.env.MCP_VISION_MODEL || "mimo-v2.5"),
         },
         multiMedias: multiMedias.map((m: any) => ({
             mediaType: m.mediaType,
@@ -1412,11 +1400,12 @@ export async function performVision(query: string, medias: any[], req?: any) {
 
     const headers: any = { 
         "Content-Type": "application/json", 
-        "Accept": "text/event-stream, text/plain, */*",
+        "Accept": "*/*",
         "Cookie": cookie, 
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/120.0.0.0", 
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36", 
         "Referer": "https://aistudio.xiaomimimo.com/", 
-        "Origin": "https://aistudio.xiaomimimo.com" 
+        "Origin": "https://aistudio.xiaomimimo.com",
+        "x-timezone": "Asia/Shanghai"
     };
 
     return new Promise((resolve, reject) => {
@@ -1428,9 +1417,10 @@ export async function performVision(query: string, medias: any[], req?: any) {
                 if (event.event === "message") {
                     try {
                         const data = JSON.parse(event.data);
-                        if (data.content) fullContent += data.content;
+                        // V2.6 模型流中会夹杂 NUL 分隔符，统一剔除
+                        if (data.content) fullContent += String(data.content).replace(/\u0000/g, "");
                     } catch (e) {}
-                } else if (event.event === "error") {
+                } else if (event.event === "error" || event.event === "sensitive_query") {
                     logger.error(`[Vision API Error Payload] ${event.data}`);
                     resolved = true;
                     resolve({
@@ -1528,21 +1518,16 @@ function smartSplitText(text: string, maxTokens: number): string[] {
 async function performMimoRequest(options: any) {
     const { query, model, conversationId, parentId, xiaomichatbot_ph, cookie, temperature, top_p } = options;
     const encodedPh = encodeURIComponent(xiaomichatbot_ph);
-    const url = `https://aistudio.xiaomimimo.com/open-apis/bot/chat?xiaomichatbot_ph=${encodedPh}`;
+    const url = `https://aistudio.xiaomimimo.com/open-apis/react/chat?xiaomichatbot_ph=${encodedPh}`;
     
-    const readyModelWithStudio = model.toLowerCase().includes("flash") && !model.endsWith("-studio") 
-                                ? `${model}-studio` 
-                                : model;
+    const readyModelWithStudio = mapStationModel(model);
 
     const payload = {
         msgId: uuidv4().replace(/-/g, ''),
         conversationId: conversationId || uuidv4().replace(/-/g, '').substring(0, 32),
         query,
-        messages: [],
-        parentId,
-        save: true,
-        source: 'STATION',
-        scene: 'STATION',
+        isEditedQuery: false,
+        // 🌟 react 协议：上下文由后端按 conversationId 记忆
         modelConfig: {
             enableThinking: false,
             model: readyModelWithStudio,
@@ -1553,7 +1538,12 @@ async function performMimoRequest(options: any) {
     };
 
     const headers = {
-        "User-Agent": "MimoStation/2.1.0",
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+        "Referer": "https://aistudio.xiaomimimo.com/",
+        "Origin": "https://aistudio.xiaomimimo.com",
+        "x-timezone": "Asia/Shanghai",
         "Cookie": cookie
     };
 
